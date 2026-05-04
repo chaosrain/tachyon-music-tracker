@@ -16,8 +16,10 @@ SPOTIFY_CLIENT_ID = config["SPOTIFY_CLIENT_ID"]
 SPOTIFY_CLIENT_SECRET = config["SPOTIFY_CLIENT_SECRET"]
 SPOTIFY_REDIRECT_URI = config["SPOTIFY_REDIRECT_URI"]
 PLAYLIST_NAME = config.get("PLAYLIST_NAME", "Tachyon Heard This")
-RECORD_SECONDS = int(config.get("RECORD_SECONDS", 10))
-LISTEN_INTERVAL = int(config.get("LISTEN_INTERVAL", 30))
+RECORD_SECONDS = int(config.get("RECORD_SECONDS", 15))
+LISTEN_INTERVAL = int(config.get("LISTEN_INTERVAL", 0))
+VOLUME_BOOST_DB = int(config.get("VOLUME_BOOST_DB", 20))
+VOLUME_GATE_DB = int(config.get("VOLUME_GATE_DB", -50))
 
 LOG_PATH = "/home/particle/music-tracker/logs/tracker.log"
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
@@ -49,6 +51,21 @@ def get_or_create_playlist():
                                   description="Songs recognized by Tachyon music tracker")
     return pl["id"]
 
+def get_max_volume_db(pcm_path):
+    """Return max volume in dBFS of raw PCM file."""
+    result = subprocess.run(
+        ['ffmpeg', '-f', 's16le', '-ar', '48000', '-ac', '2',
+         '-i', pcm_path, '-af', 'volumedetect', '-f', 'null', '/dev/null'],
+        capture_output=True, text=True
+    )
+    for line in result.stderr.splitlines():
+        if 'max_volume' in line:
+            try:
+                return float(line.split('max_volume:')[1].strip().split(' ')[0])
+            except Exception:
+                pass
+    return -99.0
+
 def record_audio(seconds=RECORD_SECONDS):
     raw = tempfile.mktemp(suffix=".pcm")
     mp3 = tempfile.mktemp(suffix=".mp3")
@@ -58,13 +75,21 @@ def record_audio(seconds=RECORD_SECONDS):
          '-p', '1024', '-n', '4'],
         timeout=seconds + 5
     )
+
+    # Volume gate — skip silent clips
+    max_vol = get_max_volume_db(raw)
+    log.debug(f"Raw max volume: {max_vol} dB (gate: {VOLUME_GATE_DB} dB)")
+    if max_vol < VOLUME_GATE_DB:
+        log.info(f"Silent clip ({max_vol} dB), skipping.")
+        os.remove(raw)
+        return None
+
     subprocess.run(
         ['ffmpeg', '-y', '-f', 's16le', '-ar', '48000', '-ac', '2',
-         '-i', raw, '-af', 'volume=20dB', mp3],
+         '-i', raw, '-af', f'volume={VOLUME_BOOST_DB}dB', mp3],
         capture_output=True
     )
-    if os.path.exists(raw):
-        os.remove(raw)
+    os.remove(raw)
     return mp3
 
 def recognize_song(mp3_path):
@@ -81,6 +106,7 @@ def add_to_playlist(playlist_id, track_uri):
 
 def main():
     log.info("Music tracker started.")
+    log.info(f"Settings: {RECORD_SECONDS}s clips, {VOLUME_BOOST_DB}dB boost, {VOLUME_GATE_DB}dB gate, {LISTEN_INTERVAL}s interval")
     playlist_id = get_or_create_playlist()
     log.info(f"Using playlist: {PLAYLIST_NAME} ({playlist_id})")
     seen = set()
@@ -89,6 +115,11 @@ def main():
         try:
             log.info("Recording...")
             mp3 = record_audio()
+
+            if mp3 is None:
+                time.sleep(LISTEN_INTERVAL)
+                continue
+
             log.info("Recognizing...")
             result = recognize_song(mp3)
             if os.path.exists(mp3):
