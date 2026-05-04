@@ -24,6 +24,7 @@ PLAYLIST_NAME = config.get("PLAYLIST_NAME", "Tachyon Heard This")
 RECORD_SECONDS = int(config.get("RECORD_SECONDS", 15))
 LISTEN_INTERVAL = int(config.get("LISTEN_INTERVAL", 0))
 VOLUME_GATE_DB = int(config.get("VOLUME_GATE_DB", -50))
+VOLUME_BOOST_DB = int(config.get("VOLUME_BOOST_DB", 0))
 HA_URL = config.get("HA_URL", "").rstrip("/")
 HA_TOKEN = config.get("HA_TOKEN", "")
 
@@ -286,10 +287,11 @@ def record_audio(seconds=RECORD_SECONDS):
         os.remove(raw)
         return None
 
-    log.info(f"Audio level: {max_vol} dB")
+    boost_str = f" (+{VOLUME_BOOST_DB}dB boost)" if VOLUME_BOOST_DB else ""
+    log.info(f"Audio level: {max_vol} dB{boost_str}")
     subprocess.run(
         ["ffmpeg", "-y", "-f", "s16le", "-ar", "48000", "-ac", "2",
-         "-i", raw, mp3],
+         "-i", raw] + (["-af", f"volume={VOLUME_BOOST_DB}dB"] if VOLUME_BOOST_DB else []) + [mp3],
         capture_output=True
     )
     os.remove(raw)
