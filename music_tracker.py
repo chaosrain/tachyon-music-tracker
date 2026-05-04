@@ -5,14 +5,18 @@ import time
 import os
 import subprocess
 import logging
-from datetime import datetime
+import hmac
+import hashlib
+import base64
+import json
+from datetime import datetime, date
 from spotipy.oauth2 import SpotifyOAuth
 from dotenv import dotenv_values
 
 CONFIG_PATH = "/home/particle/music-tracker/config/config.env"
 config = dotenv_values(CONFIG_PATH)
 
-AUDD_API_KEY = config["AUDD_API_KEY"]
+AUDD_API_KEY = config.get("AUDD_API_KEY", "")
 SPOTIFY_CLIENT_ID = config["SPOTIFY_CLIENT_ID"]
 SPOTIFY_CLIENT_SECRET = config["SPOTIFY_CLIENT_SECRET"]
 SPOTIFY_REDIRECT_URI = config["SPOTIFY_REDIRECT_URI"]
@@ -23,7 +27,17 @@ VOLUME_GATE_DB = int(config.get("VOLUME_GATE_DB", -50))
 HA_URL = config.get("HA_URL", "").rstrip("/")
 HA_TOKEN = config.get("HA_TOKEN", "")
 
+ACRCLOUD_HOST = config.get("ACRCLOUD_HOST", "")
+ACRCLOUD_KEY = config.get("ACRCLOUD_KEY", "")
+ACRCLOUD_SECRET = config.get("ACRCLOUD_SECRET", "")
+ACRCLOUD_DAILY_LIMIT = int(config.get("ACRCLOUD_DAILY_LIMIT", 90))
+
+RAPIDAPI_KEY = config.get("RAPIDAPI_KEY", "")
+SHAZAM_DAILY_LIMIT = int(config.get("SHAZAM_DAILY_LIMIT", 15))
+
+STATS_PATH = "/home/particle/music-tracker/logs/api_usage.json"
 LOG_PATH = "/home/particle/music-tracker/logs/tracker.log"
+
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +57,187 @@ sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
     cache_path="/home/particle/music-tracker/.cache/spotify_cache.json"
 ))
 
+
+# ---------------------------------------------------------------------------
+# API usage tracker
+# ---------------------------------------------------------------------------
+
+def load_stats():
+    today = str(date.today())
+    if os.path.exists(STATS_PATH):
+        try:
+            with open(STATS_PATH) as f:
+                stats = json.load(f)
+            if stats.get("date") != today:
+                stats = {"date": today, "acrcloud": 0, "shazam": 0, "last_used": "shazam"}
+        except Exception:
+            stats = {"date": today, "acrcloud": 0, "shazam": 0, "last_used": "shazam"}
+    else:
+        stats = {"date": today, "acrcloud": 0, "shazam": 0, "last_used": "shazam"}
+    return stats
+
+def save_stats(stats):
+    with open(STATS_PATH, "w") as f:
+        json.dump(stats, f)
+
+def pick_recognizer(stats):
+    """Round-robin, but skip any service that has hit its daily limit."""
+    acr_ok = bool(ACRCLOUD_HOST) and stats["acrcloud"] < ACRCLOUD_DAILY_LIMIT
+    shazam_ok = bool(RAPIDAPI_KEY) and stats["shazam"] < SHAZAM_DAILY_LIMIT
+
+    if not acr_ok and not shazam_ok:
+        return None
+
+    # Alternate from whichever was used last
+    if stats["last_used"] == "acrcloud":
+        return "shazam" if shazam_ok else "acrcloud"
+    else:
+        return "acrcloud" if acr_ok else "shazam"
+
+
+# ---------------------------------------------------------------------------
+# ACRCloud
+# ---------------------------------------------------------------------------
+
+def recognize_acrcloud(mp3_path):
+    timestamp = str(int(time.time()))
+    string_to_sign = "\n".join(["POST", "/v1/identify", ACRCLOUD_KEY,
+                                 "audio", "1", timestamp])
+    signature = base64.b64encode(
+        hmac.new(ACRCLOUD_SECRET.encode(), string_to_sign.encode(),
+                  digestmod=hashlib.sha1).digest()
+    ).decode()
+
+    with open(mp3_path, "rb") as f:
+        audio_data = f.read()
+
+    response = requests.post(
+        f"https://{ACRCLOUD_HOST}/v1/identify",
+        files={"sample": audio_data},
+        data={
+            "access_key": ACRCLOUD_KEY,
+            "sample_bytes": len(audio_data),
+            "timestamp": timestamp,
+            "signature": signature,
+            "data_type": "audio",
+            "signature_version": "1"
+        },
+        timeout=10
+    )
+    raw = response.json()
+
+    # Normalize to common format
+    status_code = raw.get("status", {}).get("code", -1)
+    if status_code == 0 and raw.get("metadata", {}).get("music"):
+        music = raw["metadata"]["music"][0]
+        title = music.get("title", "Unknown")
+        artist = music.get("artists", [{}])[0].get("name", "Unknown")
+        album = music.get("album", {}).get("name", "Unknown")
+        spotify_id = (music.get("external_metadata", {})
+                      .get("spotify", {}).get("track", {}).get("id", ""))
+        spotify_url = f"https://open.spotify.com/track/{spotify_id}" if spotify_id else ""
+        track_uri = f"spotify:track:{spotify_id}" if spotify_id else None
+        return {"matched": True, "title": title, "artist": artist,
+                "album": album, "spotify_url": spotify_url, "track_uri": track_uri,
+                "rate_limited": False}
+    elif status_code == 3003:
+        return {"matched": False, "rate_limited": True}
+    else:
+        return {"matched": False, "rate_limited": False}
+
+
+# ---------------------------------------------------------------------------
+# Shazam via RapidAPI
+# ---------------------------------------------------------------------------
+
+def recognize_shazam(mp3_path):
+    with open(mp3_path, "rb") as f:
+        audio_data = f.read()
+
+    response = requests.post(
+        "https://shazam.p.rapidapi.com/songs/v2/detect",
+        headers={
+            "X-RapidAPI-Key": RAPIDAPI_KEY,
+            "X-RapidAPI-Host": "shazam.p.rapidapi.com",
+            "Content-Type": "text/plain"
+        },
+        data=base64.b64encode(audio_data).decode(),
+        timeout=10
+    )
+
+    if response.status_code == 429:
+        return {"matched": False, "rate_limited": True}
+
+    raw = response.json()
+
+    # Normalize to common format
+    track = raw.get("track")
+    if not track:
+        return {"matched": False, "rate_limited": False}
+
+    title = track.get("title", "Unknown")
+    artist = track.get("subtitle", "Unknown")
+    album = (track.get("sections", [{}])[0].get("metadata", [{}])[0].get("text", "Unknown")
+             if track.get("sections") else "Unknown")
+
+    # Extract Spotify URI from hub providers
+    track_uri = None
+    spotify_url = ""
+    for provider in track.get("hub", {}).get("providers", []):
+        for action in provider.get("actions", []):
+            uri = action.get("uri", "")
+            if uri.startswith("spotify:track:"):
+                track_uri = uri
+                track_id = uri.split(":")[-1]
+                spotify_url = f"https://open.spotify.com/track/{track_id}"
+                break
+
+    return {"matched": True, "title": title, "artist": artist,
+            "album": album, "spotify_url": spotify_url, "track_uri": track_uri,
+            "rate_limited": False}
+
+
+# ---------------------------------------------------------------------------
+# Routing
+# ---------------------------------------------------------------------------
+
+def recognize_song(mp3_path):
+    stats = load_stats()
+    services = ["acrcloud", "shazam"]
+
+    for _ in range(2):
+        service = pick_recognizer(stats)
+        if service is None:
+            log.warning("All recognition services have hit their daily limit.")
+            return None
+
+        log.info(f"Using {service} ({stats[service]}/{ACRCLOUD_DAILY_LIMIT if service == 'acrcloud' else SHAZAM_DAILY_LIMIT} today)")
+
+        try:
+            result = recognize_acrcloud(mp3_path) if service == "acrcloud" else recognize_shazam(mp3_path)
+        except Exception as e:
+            log.warning(f"{service} error: {e}")
+            stats["last_used"] = service
+            save_stats(stats)
+            continue
+
+        stats[service] += 1
+        stats["last_used"] = service
+        save_stats(stats)
+
+        if result.get("rate_limited"):
+            log.warning(f"{service} rate limited, trying other service.")
+            continue
+
+        return result
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Spotify
+# ---------------------------------------------------------------------------
+
 def get_or_create_playlist():
     user_id = sp.current_user()["id"]
     playlists = sp.current_user_playlists(limit=50)
@@ -52,6 +247,14 @@ def get_or_create_playlist():
     pl = sp.user_playlist_create(user_id, PLAYLIST_NAME, public=False,
                                   description="Songs recognized by Tachyon music tracker")
     return pl["id"]
+
+def add_to_playlist(playlist_id, track_uri):
+    sp.playlist_add_items(playlist_id, [track_uri])
+
+
+# ---------------------------------------------------------------------------
+# Audio
+# ---------------------------------------------------------------------------
 
 def get_max_volume_db(pcm_path):
     result = subprocess.run(
@@ -92,17 +295,10 @@ def record_audio(seconds=RECORD_SECONDS):
     os.remove(raw)
     return mp3
 
-def recognize_song(mp3_path):
-    with open(mp3_path, "rb") as f:
-        response = requests.post(
-            "https://api.audd.io/",
-            data={"api_token": AUDD_API_KEY, "return": "spotify"},
-            files={"file": f}
-        )
-    return response.json()
 
-def add_to_playlist(playlist_id, track_uri):
-    sp.playlist_add_items(playlist_id, [track_uri])
+# ---------------------------------------------------------------------------
+# Home Assistant
+# ---------------------------------------------------------------------------
 
 def update_ha_sensor(title, artist, album, spotify_url, captured_at):
     if not HA_URL or not HA_TOKEN:
@@ -135,13 +331,19 @@ def update_ha_sensor(title, artist, album, spotify_url, captured_at):
     except Exception as e:
         log.warning(f"HA sensor update error: {e}")
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     log.info("Music tracker started.")
     log.info(f"Settings: {RECORD_SECONDS}s clips, {VOLUME_GATE_DB}dB gate, {LISTEN_INTERVAL}s interval")
+    log.info(f"Recognition: ACRCloud ({'enabled' if ACRCLOUD_HOST else 'disabled'}, limit {ACRCLOUD_DAILY_LIMIT}/day) | "
+             f"Shazam ({'enabled' if RAPIDAPI_KEY else 'disabled'}, limit {SHAZAM_DAILY_LIMIT}/day)")
     if HA_URL and HA_TOKEN:
-        log.info(f"Home Assistant integration enabled: {HA_URL}")
-    else:
-        log.info("Home Assistant integration disabled (HA_URL/HA_TOKEN not set).")
+        log.info(f"Home Assistant: {HA_URL}")
+
     playlist_id = get_or_create_playlist()
     log.info(f"Using playlist: {PLAYLIST_NAME} ({playlist_id})")
     seen = set()
@@ -157,21 +359,21 @@ def main():
 
             log.info("Recognizing...")
             result = recognize_song(mp3)
+
             if os.path.exists(mp3):
                 os.remove(mp3)
 
-            if result.get("status") == "success" and result.get("result"):
-                song = result["result"]
-                title = song.get("title", "Unknown")
-                artist = song.get("artist", "Unknown")
-                album = song.get("album", "Unknown")
-                song_link = song.get("song_link", "")
-                spotify_data = song.get("spotify", {})
-                track_uri = spotify_data.get("uri") if spotify_data else None
-                spotify_url = (
-                    spotify_data.get("external_urls", {}).get("spotify", song_link)
-                    if spotify_data else song_link
-                )
+            if result is None:
+                log.warning("No recognition service available.")
+                time.sleep(60)
+                continue
+
+            if result.get("matched"):
+                title = result["title"]
+                artist = result["artist"]
+                album = result["album"]
+                spotify_url = result["spotify_url"]
+                track_uri = result["track_uri"]
                 captured_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                 log.info(f"Recognized: {title} by {artist}")
@@ -186,12 +388,13 @@ def main():
                 else:
                     log.info("No Spotify URI found for this track.")
             else:
-                log.info(f"No match. Response: {result.get('status')}")
+                log.info("No match.")
 
         except Exception as e:
             log.error(f"Error: {e}")
 
         time.sleep(LISTEN_INTERVAL)
+
 
 if __name__ == "__main__":
     main()
