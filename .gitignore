@@ -1,0 +1,8 @@
+config/config.env
+*.pyc
+__pycache__/
+logs/
+*.pcm
+*.wav
+*.mp3
+.cache/
