@@ -18,7 +18,6 @@ SPOTIFY_REDIRECT_URI = config["SPOTIFY_REDIRECT_URI"]
 PLAYLIST_NAME = config.get("PLAYLIST_NAME", "Tachyon Heard This")
 RECORD_SECONDS = int(config.get("RECORD_SECONDS", 15))
 LISTEN_INTERVAL = int(config.get("LISTEN_INTERVAL", 0))
-VOLUME_BOOST_DB = int(config.get("VOLUME_BOOST_DB", 20))
 VOLUME_GATE_DB = int(config.get("VOLUME_GATE_DB", -50))
 
 LOG_PATH = "/home/particle/music-tracker/logs/tracker.log"
@@ -52,7 +51,6 @@ def get_or_create_playlist():
     return pl["id"]
 
 def get_max_volume_db(pcm_path):
-    """Return max volume in dBFS of raw PCM file."""
     result = subprocess.run(
         ['ffmpeg', '-f', 's16le', '-ar', '48000', '-ac', '2',
          '-i', pcm_path, '-af', 'volumedetect', '-f', 'null', '/dev/null'],
@@ -76,17 +74,16 @@ def record_audio(seconds=RECORD_SECONDS):
         timeout=seconds + 5
     )
 
-    # Volume gate — skip silent clips
     max_vol = get_max_volume_db(raw)
-    log.debug(f"Raw max volume: {max_vol} dB (gate: {VOLUME_GATE_DB} dB)")
     if max_vol < VOLUME_GATE_DB:
         log.info(f"Silent clip ({max_vol} dB), skipping.")
         os.remove(raw)
         return None
 
+    log.info(f"Audio level: {max_vol} dB")
     subprocess.run(
         ['ffmpeg', '-y', '-f', 's16le', '-ar', '48000', '-ac', '2',
-         '-i', raw, '-af', f'volume={VOLUME_BOOST_DB}dB', mp3],
+         '-i', raw, mp3],
         capture_output=True
     )
     os.remove(raw)
@@ -106,7 +103,7 @@ def add_to_playlist(playlist_id, track_uri):
 
 def main():
     log.info("Music tracker started.")
-    log.info(f"Settings: {RECORD_SECONDS}s clips, {VOLUME_BOOST_DB}dB boost, {VOLUME_GATE_DB}dB gate, {LISTEN_INTERVAL}s interval")
+    log.info(f"Settings: {RECORD_SECONDS}s clips, {VOLUME_GATE_DB}dB gate, {LISTEN_INTERVAL}s interval")
     playlist_id = get_or_create_playlist()
     log.info(f"Using playlist: {PLAYLIST_NAME} ({playlist_id})")
     seen = set()
