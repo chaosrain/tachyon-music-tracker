@@ -5,6 +5,7 @@ import time
 import os
 import subprocess
 import logging
+from datetime import datetime
 from spotipy.oauth2 import SpotifyOAuth
 from dotenv import dotenv_values
 
@@ -19,6 +20,8 @@ PLAYLIST_NAME = config.get("PLAYLIST_NAME", "Tachyon Heard This")
 RECORD_SECONDS = int(config.get("RECORD_SECONDS", 15))
 LISTEN_INTERVAL = int(config.get("LISTEN_INTERVAL", 0))
 VOLUME_GATE_DB = int(config.get("VOLUME_GATE_DB", -50))
+HA_URL = config.get("HA_URL", "").rstrip("/")
+HA_TOKEN = config.get("HA_TOKEN", "")
 
 LOG_PATH = "/home/particle/music-tracker/logs/tracker.log"
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
@@ -52,14 +55,14 @@ def get_or_create_playlist():
 
 def get_max_volume_db(pcm_path):
     result = subprocess.run(
-        ['ffmpeg', '-f', 's16le', '-ar', '48000', '-ac', '2',
-         '-i', pcm_path, '-af', 'volumedetect', '-f', 'null', '/dev/null'],
+        ["ffmpeg", "-f", "s16le", "-ar", "48000", "-ac", "2",
+         "-i", pcm_path, "-af", "volumedetect", "-f", "null", "/dev/null"],
         capture_output=True, text=True
     )
     for line in result.stderr.splitlines():
-        if 'max_volume' in line:
+        if "max_volume" in line:
             try:
-                return float(line.split('max_volume:')[1].strip().split(' ')[0])
+                return float(line.split("max_volume:")[1].strip().split(" ")[0])
             except Exception:
                 pass
     return -99.0
@@ -68,9 +71,9 @@ def record_audio(seconds=RECORD_SECONDS):
     raw = tempfile.mktemp(suffix=".pcm")
     mp3 = tempfile.mktemp(suffix=".mp3")
     subprocess.run(
-        ['timeout', str(seconds + 2), 'tinycap', raw,
-         '-D', '0', '-d', '0', '-r', '48000', '-c', '2', '-b', '16',
-         '-p', '1024', '-n', '4'],
+        ["timeout", str(seconds + 2), "tinycap", raw,
+         "-D", "0", "-d", "0", "-r", "48000", "-c", "2", "-b", "16",
+         "-p", "1024", "-n", "4"],
         timeout=seconds + 5
     )
 
@@ -82,28 +85,63 @@ def record_audio(seconds=RECORD_SECONDS):
 
     log.info(f"Audio level: {max_vol} dB")
     subprocess.run(
-        ['ffmpeg', '-y', '-f', 's16le', '-ar', '48000', '-ac', '2',
-         '-i', raw, mp3],
+        ["ffmpeg", "-y", "-f", "s16le", "-ar", "48000", "-ac", "2",
+         "-i", raw, mp3],
         capture_output=True
     )
     os.remove(raw)
     return mp3
 
 def recognize_song(mp3_path):
-    with open(mp3_path, 'rb') as f:
+    with open(mp3_path, "rb") as f:
         response = requests.post(
-            'https://api.audd.io/',
-            data={'api_token': AUDD_API_KEY, 'return': 'spotify'},
-            files={'file': f}
+            "https://api.audd.io/",
+            data={"api_token": AUDD_API_KEY, "return": "spotify"},
+            files={"file": f}
         )
     return response.json()
 
 def add_to_playlist(playlist_id, track_uri):
     sp.playlist_add_items(playlist_id, [track_uri])
 
+def update_ha_sensor(title, artist, album, spotify_url, captured_at):
+    if not HA_URL or not HA_TOKEN:
+        return
+    try:
+        response = requests.post(
+            f"{HA_URL}/api/states/sensor.tachyon_now_playing",
+            headers={
+                "Authorization": f"Bearer {HA_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "state": f"{title} by {artist}",
+                "attributes": {
+                    "friendly_name": "Tachyon Now Playing",
+                    "title": title,
+                    "artist": artist,
+                    "album": album,
+                    "spotify_url": spotify_url,
+                    "captured_at": captured_at,
+                    "icon": "mdi:music"
+                }
+            },
+            timeout=5
+        )
+        if response.status_code in (200, 201):
+            log.info("HA sensor updated.")
+        else:
+            log.warning(f"HA sensor update failed: {response.status_code}")
+    except Exception as e:
+        log.warning(f"HA sensor update error: {e}")
+
 def main():
     log.info("Music tracker started.")
     log.info(f"Settings: {RECORD_SECONDS}s clips, {VOLUME_GATE_DB}dB gate, {LISTEN_INTERVAL}s interval")
+    if HA_URL and HA_TOKEN:
+        log.info(f"Home Assistant integration enabled: {HA_URL}")
+    else:
+        log.info("Home Assistant integration disabled (HA_URL/HA_TOKEN not set).")
     playlist_id = get_or_create_playlist()
     log.info(f"Using playlist: {PLAYLIST_NAME} ({playlist_id})")
     seen = set()
@@ -126,10 +164,18 @@ def main():
                 song = result["result"]
                 title = song.get("title", "Unknown")
                 artist = song.get("artist", "Unknown")
+                album = song.get("album", "Unknown")
+                song_link = song.get("song_link", "")
                 spotify_data = song.get("spotify", {})
                 track_uri = spotify_data.get("uri") if spotify_data else None
+                spotify_url = (
+                    spotify_data.get("external_urls", {}).get("spotify", song_link)
+                    if spotify_data else song_link
+                )
+                captured_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                 log.info(f"Recognized: {title} by {artist}")
+                update_ha_sensor(title, artist, album, spotify_url, captured_at)
 
                 if track_uri and track_uri not in seen:
                     add_to_playlist(playlist_id, track_uri)
