@@ -60,7 +60,7 @@ def record_audio(seconds=RECORD_SECONDS):
     )
     subprocess.run(
         ['ffmpeg', '-y', '-f', 's16le', '-ar', '48000', '-ac', '2',
-         '-i', raw, mp3],
+         '-i', raw, '-af', 'volume=20dB', mp3],
         capture_output=True
     )
     if os.path.exists(raw):
